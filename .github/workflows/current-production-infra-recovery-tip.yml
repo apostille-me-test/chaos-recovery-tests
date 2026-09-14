@@ -1,0 +1,82 @@
+name: current production infra recovery tip
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  current-production-infra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.TEST_FLEET_GITHUB_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+
+      - name: Test 1 - bind the maintained Apostille infra repository and exact tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${GITHUB_REPOSITORY_OWNER%-test}"
+          r=apme-infra
+          branch="$(gh api "repos/$p/$r" --jq .default_branch)"
+          sha="$(gh api "repos/$p/$r/commits/$branch" --jq .sha)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$branch"
+          test "$(git -C .deps/infra rev-parse HEAD)" = "$sha"
+          grep -Fq 'historical bootstrap alias' .deps/infra/docs/architecture.md
+          grep -Fq '`apme-infra` owns Kubernetes, Argo CD' .deps/infra/docs/architecture.md
+          printf '%s\n' "$sha" >/tmp/infra-sha
+
+      - name: Test 2 - validate the documented hybrid topology and state boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=.deps/infra
+          for path in k8s argocd cloudflare-worker terraform neon supabase; do
+            test -e "$root/$path" || { echo "documented hybrid infra path missing: $path" >&2; exit 1; }
+          done
+          test -f "$root/k8s/base/kustomization.yaml"
+          test -f "$root/argocd/application.yaml"
+          test -f "$root/cloudflare-worker/wrangler.toml"
+          test -f "$root/terraform/main.tf"
+          test -f "$root/neon/apostille-me-prod/terraform/main.tf"
+          ! find "$root" -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' -o -name 'id_rsa' -o -name 'id_ed25519' \) -print -quit | grep -q .
+
+      - name: Test 3 - every tracked Terraform root formats, initializes, and validates
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=.deps/infra
+          mapfile -t roots < <(find "$root" -type f -name '*.tf' -printf '%h\n' | sort -u)
+          ((${#roots[@]} > 0)) || { echo "no Terraform roots found at $(cat /tmp/infra-sha)" >&2; exit 1; }
+          for d in "${roots[@]}"; do
+            echo "validating Terraform root: $d"
+            terraform -chdir="$d" fmt -check -recursive
+            terraform -chdir="$d" init -backend=false -input=false
+            terraform -chdir="$d" validate -no-color
+          done
+
+      - name: Test 4 - Kubernetes and Cloudflare recovery inputs remain parseable
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=.deps/infra
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          root = Path('.deps/infra')
+          data = json.loads((root / 'deploy/gcp-cloud-run.json').read_text())
+          assert isinstance(data, (dict, list))
+          assert (root / 'k8s/base/kustomization.yaml').read_text().strip()
+          assert (root / 'argocd/application.yaml').read_text().strip()
+          assert '[env.' in (root / 'cloudflare-worker/wrangler.toml').read_text() or 'name =' in (root / 'cloudflare-worker/wrangler.toml').read_text()
+          PY
